@@ -1,0 +1,3010 @@
+# ================================================================
+# ENERGIEQUARTIER MPC — COLAB READY EXTENDED VERSION
+# Upgrades added:
+# 1) Real Freiburg weather/PV input from NASA POWER
+# 2) 7-day or 30-day comparison switch
+# 3) pandapower AC validation
+# 4) Optional OpenDSS unbalanced feeder validation
+# 5) Rainflow battery degradation
+#
+# Author-ready version for: Oihika Arpit
+# ================================================================
+
+# ================================================================
+# 0. PACKAGE INSTALLATION
+# ================================================================
+
+import sys, subprocess, importlib.util, os, json, math, shutil, warnings, textwrap
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+required_packages = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "plotly",
+    "openpyxl",
+    "tabulate",
+    "kaleido",
+    "requests",
+    "rainflow",
+    "pandapower",
+    "opendssdirect.py"
+]
+
+for package in required_packages:
+    module_name = package.replace("-", "_").replace(".py", "")
+    if package == "opendssdirect.py":
+        module_name = "opendssdirect"
+    if importlib.util.find_spec(module_name) is None:
+        print(f"Installing {package} ...")
+        subprocess.check_call([
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            package
+        ])
+
+# ================================================================
+# 1. IMPORTS
+# ================================================================
+
+import numpy as np
+import pandas as pd
+import requests
+from scipy.optimize import linprog
+
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from IPython.display import display, HTML, Markdown
+
+try:
+    import rainflow
+    RAINFLOW_AVAILABLE = True
+except Exception:
+    RAINFLOW_AVAILABLE = False
+
+try:
+    import pandapower as pp
+    PANDAPOWER_AVAILABLE = True
+except Exception:
+    PANDAPOWER_AVAILABLE = False
+
+try:
+    import opendssdirect as dss
+    OPENDSS_AVAILABLE = True
+except Exception:
+    OPENDSS_AVAILABLE = False
+
+np.random.seed(42)
+
+# ================================================================
+# 2. USER CONTROLS
+# ================================================================
+
+# Choose 7 or 30.
+SIMULATION_DAYS = 7
+# SIMULATION_DAYS = 30
+
+# Historical data year for NASA POWER.
+# 2024 is used because it is usually complete and stable for hourly weather.
+NASA_POWER_YEAR = 2024
+
+# Freiburg im Breisgau, Germany
+FREIBURG_LATITUDE = 47.9990
+FREIBURG_LONGITUDE = 7.8421
+
+# If NASA POWER is temporarily unreachable, the code automatically falls back
+# to physically shaped synthetic data.
+USE_REAL_NASA_POWER = True
+
+# Optional: OpenDSS can sometimes fail in Colab depending on environment.
+# The code will not stop if OpenDSS fails.
+RUN_OPENDSS_VALIDATION = True
+
+# MPC horizon.
+# 12 is a good balance between technical depth and runtime.
+MPC_HORIZON_H = 12
+
+# ================================================================
+# 3. PROJECT SETUP
+# ================================================================
+
+PROJECT_TITLE = "EnergieQuartier MPC"
+
+PROJECT_SUBTITLE = (
+    "Degradation-Aware Model Predictive Control of Battery, EV and "
+    "Heat-Pump Flexibility in a German District Microgrid"
+)
+
+OUTPUT_DIR = Path("/content/EnergieQuartier_MPC_Extended_Outputs")
+ZIP_PATH = Path("/content/EnergieQuartier_MPC_Extended_Outputs.zip")
+
+if OUTPUT_DIR.exists():
+    shutil.rmtree(OUTPUT_DIR)
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+CONFIG = {
+    "project_title": PROJECT_TITLE,
+    "project_subtitle": PROJECT_SUBTITLE,
+    "district_name": "Freiburg-East Representative German District",
+    "country": "Germany",
+    "buildings": 100,
+    "simulation_days": SIMULATION_DAYS,
+    "simulation_hours": 24 * SIMULATION_DAYS,
+    "mpc_horizon_h": MPC_HORIZON_H,
+
+    "pv_rooftop_mw": 0.35,
+    "pv_utility_mw": 0.25,
+    "wind_mw": 0.30,
+
+    "bess_power_mw": 0.30,
+    "bess_energy_mwh": 0.80,
+    "bess_initial_soc": 0.50,
+    "bess_min_soc": 0.15,
+    "bess_max_soc": 0.95,
+    "bess_roundtrip_efficiency": 0.92,
+    "bess_cycle_life_reference": 6000,
+    "battery_replacement_eur_per_kwh": 350,
+
+    "ev_power_mw": 0.18,
+    "ev_energy_mwh": 0.55,
+    "ev_initial_soc": 0.60,
+    "ev_min_soc": 0.20,
+    "ev_max_soc": 0.95,
+    "ev_roundtrip_efficiency": 0.90,
+
+    "heat_pump_max_mw": 0.15,
+    "grid_connection_mw": 0.85,
+
+    "voltage_min_pu": 0.95,
+    "voltage_max_pu": 1.05,
+
+    "carbon_price_eur_per_tonne": 100.0,
+
+    "feeder_stress_hour": min(31, 24 * SIMULATION_DAYS - 1),
+    "feeder_stress_derating": 0.70,
+
+    "frequency_droop_gain": 0.08,
+    "synthetic_inertia_gain": 0.12
+}
+
+with open(OUTPUT_DIR / "configuration.json", "w", encoding="utf-8") as file:
+    json.dump(CONFIG, file, indent=2)
+
+display(HTML(f"""
+<div style="
+padding:24px;
+border-radius:22px;
+background:linear-gradient(135deg,#003c3c,#00bfa5,#76ff03);
+color:white;
+font-family:Arial;
+box-shadow:0 10px 30px rgba(0,0,0,.25);
+">
+<h1 style="margin:0;font-size:34px;">⚡ {PROJECT_TITLE}</h1>
+<h3 style="margin:8px 0 0 0;">{PROJECT_SUBTITLE}</h3>
+<p style="margin:10px 0 0 0;font-size:16px;">
+Freiburg NASA POWER Weather • MPC • BESS • EV • Heat Pumps • pandapower AC Validation • Optional OpenDSS • Rainflow Degradation
+</p>
+</div>
+"""))
+
+# ================================================================
+# 4. REAL FREIBURG WEATHER FROM NASA POWER
+# ================================================================
+
+def fetch_nasa_power_freiburg(year=2024, days=7):
+    """
+    Fetches hourly NASA POWER weather data for Freiburg.
+
+    Parameters used:
+    - ALLSKY_SFC_SW_DWN: all-sky surface shortwave irradiance, kWh/m²/hour
+    - T2M: temperature at 2 m, degree Celsius
+    - WS10M: wind speed at 10 m, m/s
+    """
+
+    start_date = f"{year}0601"
+    end_date = f"{year}0630"
+
+    url = (
+        "https://power.larc.nasa.gov/api/temporal/hourly/point"
+        f"?parameters=ALLSKY_SFC_SW_DWN,T2M,WS10M"
+        f"&community=RE"
+        f"&longitude={FREIBURG_LONGITUDE}"
+        f"&latitude={FREIBURG_LATITUDE}"
+        f"&start={start_date}"
+        f"&end={end_date}"
+        f"&format=JSON"
+    )
+
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+
+    payload = response.json()
+    parameters = payload["properties"]["parameter"]
+
+    ghi = parameters["ALLSKY_SFC_SW_DWN"]
+    temp = parameters["T2M"]
+    wind = parameters["WS10M"]
+
+    records = []
+
+    for key in sorted(ghi.keys()):
+        ts_utc = pd.to_datetime(key, format="%Y%m%d%H", utc=True)
+
+        records.append({
+            "timestamp_utc": ts_utc,
+            "ghi_kwh_m2": float(ghi[key]),
+            "ambient_temperature_c": float(temp[key]),
+            "wind_speed_mps": float(wind[key])
+        })
+
+    weather = pd.DataFrame(records)
+
+    weather["timestamp"] = (
+        weather["timestamp_utc"]
+        .dt.tz_convert("Europe/Berlin")
+        .dt.tz_localize(None)
+    )
+
+    weather = weather.sort_values("timestamp").reset_index(drop=True)
+    weather = weather.iloc[:24 * days].copy()
+
+    return weather
+
+
+def synthetic_freiburg_weather(days=7, seed=42):
+    rng = np.random.default_rng(seed)
+
+    timestamp = pd.date_range(
+        f"{NASA_POWER_YEAR}-06-01 00:00:00",
+        periods=24 * days,
+        freq="h"
+    )
+
+    hour = timestamp.hour.to_numpy()
+    step = np.arange(len(timestamp))
+
+    solar_shape = np.maximum(0, np.sin(np.pi * (hour - 5.2) / 15.2)) ** 1.65
+
+    ghi = np.clip(
+        0.92 * solar_shape
+        * (0.88 + 0.10 * np.sin(2 * np.pi * step / 72))
+        + rng.normal(0, 0.025, len(timestamp)),
+        0,
+        1.05
+    )
+
+    temperature = (
+        16
+        + 7 * np.sin(2 * np.pi * (hour - 8) / 24)
+        + rng.normal(0, 0.9, len(timestamp))
+    )
+
+    wind_speed = np.clip(
+        4.4
+        + 1.2 * np.sin(2 * np.pi * step / 36)
+        + rng.normal(0, 0.6, len(timestamp)),
+        0.5,
+        10
+    )
+
+    return pd.DataFrame({
+        "timestamp": timestamp,
+        "ghi_kwh_m2": ghi,
+        "ambient_temperature_c": temperature,
+        "wind_speed_mps": wind_speed
+    })
+
+
+def get_weather_data():
+    if USE_REAL_NASA_POWER:
+        try:
+            print("Downloading real hourly Freiburg weather from NASA POWER...")
+            weather = fetch_nasa_power_freiburg(
+                year=NASA_POWER_YEAR,
+                days=SIMULATION_DAYS
+            )
+            weather["weather_source"] = "NASA POWER Freiburg"
+            print("NASA POWER weather loaded successfully.")
+            return weather
+        except Exception as error:
+            print("NASA POWER failed. Falling back to synthetic weather.")
+            print("Reason:", error)
+
+    weather = synthetic_freiburg_weather(days=SIMULATION_DAYS)
+    weather["weather_source"] = "Synthetic Freiburg fallback"
+    return weather
+
+
+weather = get_weather_data()
+
+display(
+    weather.head(10)
+    .style
+    .background_gradient(cmap="YlGnBu")
+    .format(precision=3)
+)
+
+weather.to_csv(OUTPUT_DIR / "freiburg_weather_input.csv", index=False)
+
+# ================================================================
+# 5. DISTRICT DATA GENERATION USING REAL WEATHER
+# ================================================================
+
+def wind_capacity_factor_from_speed(ws):
+    """
+    Simple wind turbine power curve approximation.
+    Cut-in: 3 m/s
+    Rated: 12 m/s
+    Cut-out: 25 m/s
+    """
+    ws = np.asarray(ws)
+
+    cf = np.zeros_like(ws, dtype=float)
+
+    mask = (ws >= 3) & (ws < 12)
+    cf[mask] = ((ws[mask] - 3) / (12 - 3)) ** 3
+
+    mask_rated = (ws >= 12) & (ws <= 25)
+    cf[mask_rated] = 1.0
+
+    return np.clip(cf, 0, 0.85)
+
+
+def generate_german_district_data_from_weather(weather, seed=42):
+    rng = np.random.default_rng(seed)
+
+    dataframe = weather.copy().reset_index(drop=True)
+    hours = len(dataframe)
+
+    timestamp = pd.to_datetime(dataframe["timestamp"])
+    hour = timestamp.dt.hour.to_numpy()
+    step = np.arange(hours)
+
+    household_load = (
+        0.20
+        + 0.10 * np.exp(-((hour - 7.5) / 2.3) ** 2)
+        + 0.20 * np.exp(-((hour - 19.0) / 3.0) ** 2)
+        + rng.normal(0, 0.008, hours)
+    )
+
+    commercial_load = (
+        0.045
+        + 0.19 * np.exp(-((hour - 13.0) / 4.0) ** 2)
+        + rng.normal(0, 0.006, hours)
+    )
+
+    household_load = np.clip(household_load, 0.12, None)
+    commercial_load = np.clip(commercial_load, 0.02, None)
+
+    # PV capacity factor from GHI and temperature derating.
+    # GHI around 1 kWh/m²/h at noon is treated as nearly full irradiance.
+    temp_derate = np.clip(
+        1 - 0.004 * (dataframe["ambient_temperature_c"].to_numpy() - 25),
+        0.85,
+        1.08
+    )
+
+    pv_capacity_factor = np.clip(
+        dataframe["ghi_kwh_m2"].to_numpy() * temp_derate,
+        0,
+        1.0
+    )
+
+    wind_capacity_factor = wind_capacity_factor_from_speed(
+        dataframe["wind_speed_mps"].to_numpy()
+    )
+
+    import_price = np.where(
+        (hour >= 17) & (hour <= 21),
+        0.42,
+        np.where((hour >= 0) & (hour <= 5), 0.20, 0.30)
+    )
+
+    import_price = np.clip(
+        import_price
+        + 0.025 * np.sin(2 * np.pi * step / 48)
+        + rng.normal(0, 0.006, hours),
+        0.15,
+        0.55
+    )
+
+    carbon_intensity = np.clip(
+        0.34
+        + 0.10 * np.sin(2 * np.pi * (hour - 3) / 24)
+        - 0.10 * pv_capacity_factor
+        + rng.normal(0, 0.012, hours),
+        0.16,
+        0.55
+    )
+
+    heat_demand = np.clip(
+        0.035 + 0.005 * np.maximum(0, 18 - dataframe["ambient_temperature_c"].to_numpy()),
+        0.025,
+        0.13
+    )
+
+    ev_available = ((hour <= 7) | (hour >= 18)).astype(float)
+
+    ev_drive_energy = np.where(
+        hour == 8,
+        0.065,
+        np.where(hour == 18, 0.055, 0.0)
+    )
+
+    frequency_hz = 50 + rng.normal(0, 0.025, hours)
+
+    # Inject a few frequency events for grid-supportive mode.
+    event_hours = [14, 31, 39, 82, 119, 155, 221, 301, 480, 620]
+    for h in event_hours:
+        if h < hours:
+            frequency_hz[h] += rng.choice([-0.22, -0.18, 0.17])
+
+    dataframe["household_load_mw"] = household_load
+    dataframe["commercial_load_mw"] = commercial_load
+    dataframe["pv_capacity_factor"] = pv_capacity_factor
+    dataframe["wind_capacity_factor"] = wind_capacity_factor
+    dataframe["import_price_eur_per_kwh"] = import_price
+    dataframe["feed_in_tariff_eur_per_kwh"] = 0.082
+    dataframe["grid_carbon_kg_per_kwh"] = carbon_intensity
+    dataframe["heat_demand_mw"] = heat_demand
+    dataframe["ev_available"] = ev_available
+    dataframe["ev_drive_energy_mwh"] = ev_drive_energy
+    dataframe["frequency_hz"] = frequency_hz
+
+    dataframe["base_load_mw"] = (
+        dataframe["household_load_mw"]
+        + dataframe["commercial_load_mw"]
+    )
+
+    dataframe["pv_available_mw"] = (
+        CONFIG["pv_rooftop_mw"]
+        + CONFIG["pv_utility_mw"]
+    ) * dataframe["pv_capacity_factor"]
+
+    dataframe["wind_available_mw"] = (
+        CONFIG["wind_mw"]
+        * dataframe["wind_capacity_factor"]
+    )
+
+    return dataframe
+
+
+def create_forecasts(dataframe, seed=7):
+    rng = np.random.default_rng(seed)
+
+    forecast = dataframe.copy()
+
+    forecast["load_forecast_mw"] = (
+        forecast["base_load_mw"]
+        * np.clip(1 + rng.normal(0, 0.025, len(forecast)), 0.90, 1.10)
+    )
+
+    forecast["pv_forecast_mw"] = (
+        forecast["pv_available_mw"]
+        * np.clip(1 + rng.normal(0, 0.06, len(forecast)), 0.70, 1.20)
+    )
+
+    forecast["wind_forecast_mw"] = (
+        forecast["wind_available_mw"]
+        * np.clip(1 + rng.normal(0, 0.08, len(forecast)), 0.65, 1.25)
+    )
+
+    forecast["price_forecast_eur_per_kwh"] = (
+        forecast["import_price_eur_per_kwh"]
+        * np.clip(1 + rng.normal(0, 0.025, len(forecast)), 0.90, 1.10)
+    )
+
+    for col in ["load_forecast_mw", "pv_forecast_mw", "wind_forecast_mw"]:
+        forecast[col] = forecast[col].clip(lower=0)
+
+    return forecast
+
+
+data = create_forecasts(
+    generate_german_district_data_from_weather(weather)
+)
+
+data.to_csv(OUTPUT_DIR / "input_and_forecast_data_real_freiburg.csv", index=False)
+
+display(
+    data.head(10)
+    .style
+    .background_gradient(cmap="YlGnBu")
+    .format(precision=3)
+)
+
+# ================================================================
+# 6. LINEAR MPC MODEL
+# ================================================================
+
+VAR_NAMES = [
+    "grid_import",
+    "grid_export",
+    "bess_charge",
+    "bess_discharge",
+    "ev_charge",
+    "ev_discharge",
+    "heat_pump",
+    "load_shed",
+    "pv_curtail",
+    "wind_curtail",
+    "bess_soc",
+    "ev_soc",
+    "heat_shortfall",
+    "ev_mobility_shortfall"
+]
+
+
+def vidx(name, step, horizon):
+    return VAR_NAMES.index(name) * horizon + step
+
+
+def solve_mpc_window(
+    window,
+    bess_soc0,
+    ev_soc0,
+    mode="degradation_aware_mpc",
+    feeder_stress=False
+):
+    horizon = len(window)
+    nvars = len(VAR_NAMES) * horizon
+
+    cost = np.zeros(nvars)
+
+    eta_bess = math.sqrt(CONFIG["bess_roundtrip_efficiency"])
+    eta_ev = math.sqrt(CONFIG["ev_roundtrip_efficiency"])
+
+    grid_capacity = CONFIG["grid_connection_mw"]
+
+    if feeder_stress:
+        grid_capacity *= CONFIG["feeder_stress_derating"]
+
+    replacement_cost = (
+        CONFIG["battery_replacement_eur_per_kwh"]
+        * CONFIG["bess_energy_mwh"]
+        * 1000
+    )
+
+    degradation_eur_per_mwh = (
+        replacement_cost
+        /
+        (
+            2
+            * CONFIG["bess_cycle_life_reference"]
+            * CONFIG["bess_energy_mwh"]
+        )
+    )
+
+    use_carbon = mode in [
+        "degradation_aware_mpc",
+        "grid_supportive_mpc"
+    ]
+
+    use_degradation = mode in [
+        "degradation_aware_mpc",
+        "grid_supportive_mpc"
+    ]
+
+    for step in range(horizon):
+        row = window.iloc[step]
+
+        import_price = float(row["price_forecast_eur_per_kwh"])
+        export_price = float(row["feed_in_tariff_eur_per_kwh"])
+        carbon = float(row["grid_carbon_kg_per_kwh"])
+
+        cost[vidx("grid_import", step, horizon)] = (
+            import_price * 1000
+            + (
+                carbon * CONFIG["carbon_price_eur_per_tonne"]
+                if use_carbon
+                else 0
+            )
+        )
+
+        cost[vidx("grid_export", step, horizon)] = -export_price * 1000
+
+        cycling_penalty = degradation_eur_per_mwh if use_degradation else 0.5
+
+        cost[vidx("bess_charge", step, horizon)] = cycling_penalty + 0.1
+        cost[vidx("bess_discharge", step, horizon)] = cycling_penalty + 0.1
+        cost[vidx("ev_charge", step, horizon)] = 0.2
+        cost[vidx("ev_discharge", step, horizon)] = 0.2
+        cost[vidx("heat_pump", step, horizon)] = 2.0
+        cost[vidx("load_shed", step, horizon)] = 25000
+        cost[vidx("pv_curtail", step, horizon)] = 20
+        cost[vidx("wind_curtail", step, horizon)] = 20
+        cost[vidx("heat_shortfall", step, horizon)] = 8000
+        cost[vidx("ev_mobility_shortfall", step, horizon)] = 25000
+        cost[vidx("bess_soc", step, horizon)] = 0.01
+        cost[vidx("ev_soc", step, horizon)] = 0.01
+
+    A_eq = []
+    b_eq = []
+    A_ub = []
+    b_ub = []
+
+    for step in range(horizon):
+        row = window.iloc[step]
+
+        # Power balance
+        eq = np.zeros(nvars)
+
+        eq[vidx("grid_import", step, horizon)] = 1
+        eq[vidx("grid_export", step, horizon)] = -1
+        eq[vidx("bess_discharge", step, horizon)] = 1
+        eq[vidx("bess_charge", step, horizon)] = -1
+        eq[vidx("ev_discharge", step, horizon)] = 1
+        eq[vidx("ev_charge", step, horizon)] = -1
+        eq[vidx("heat_pump", step, horizon)] = -1
+        eq[vidx("load_shed", step, horizon)] = 1
+        eq[vidx("pv_curtail", step, horizon)] = -1
+        eq[vidx("wind_curtail", step, horizon)] = -1
+
+        rhs = float(
+            row["load_forecast_mw"]
+            - row["pv_forecast_mw"]
+            - row["wind_forecast_mw"]
+        )
+
+        A_eq.append(eq)
+        b_eq.append(rhs)
+
+        # BESS SOC
+        eq = np.zeros(nvars)
+
+        eq[vidx("bess_soc", step, horizon)] = 1
+        eq[vidx("bess_charge", step, horizon)] = (
+            -eta_bess / CONFIG["bess_energy_mwh"]
+        )
+        eq[vidx("bess_discharge", step, horizon)] = (
+            1 / (eta_bess * CONFIG["bess_energy_mwh"])
+        )
+
+        if step == 0:
+            rhs = bess_soc0
+        else:
+            eq[vidx("bess_soc", step - 1, horizon)] = -1
+            rhs = 0
+
+        A_eq.append(eq)
+        b_eq.append(rhs)
+
+        # EV SOC
+        eq = np.zeros(nvars)
+
+        eq[vidx("ev_soc", step, horizon)] = 1
+        eq[vidx("ev_charge", step, horizon)] = (
+            -eta_ev / CONFIG["ev_energy_mwh"]
+        )
+        eq[vidx("ev_discharge", step, horizon)] = (
+            1 / (eta_ev * CONFIG["ev_energy_mwh"])
+        )
+        eq[vidx("ev_mobility_shortfall", step, horizon)] = (
+            -1 / CONFIG["ev_energy_mwh"]
+        )
+
+        drive_fraction = float(
+            row["ev_drive_energy_mwh"] / CONFIG["ev_energy_mwh"]
+        )
+
+        if step == 0:
+            rhs = ev_soc0 - drive_fraction
+        else:
+            eq[vidx("ev_soc", step - 1, horizon)] = -1
+            rhs = -drive_fraction
+
+        A_eq.append(eq)
+        b_eq.append(rhs)
+
+        # Heat satisfaction
+        ub = np.zeros(nvars)
+        ub[vidx("heat_pump", step, horizon)] = -1
+        ub[vidx("heat_shortfall", step, horizon)] = -1
+
+        A_ub.append(ub)
+        b_ub.append(-float(row["heat_demand_mw"]))
+
+    bounds = []
+
+    for name in VAR_NAMES:
+        for step in range(horizon):
+            row = window.iloc[step]
+
+            if name in ["grid_import", "grid_export"]:
+                bounds.append((0, grid_capacity))
+
+            elif name in ["bess_charge", "bess_discharge"]:
+                bounds.append((0, CONFIG["bess_power_mw"]))
+
+            elif name in ["ev_charge", "ev_discharge"]:
+                bounds.append(
+                    (
+                        0,
+                        CONFIG["ev_power_mw"] * float(row["ev_available"])
+                    )
+                )
+
+            elif name == "heat_pump":
+                bounds.append((0, CONFIG["heat_pump_max_mw"]))
+
+            elif name == "load_shed":
+                bounds.append((0, float(row["load_forecast_mw"])))
+
+            elif name == "pv_curtail":
+                bounds.append((0, float(row["pv_forecast_mw"])))
+
+            elif name == "wind_curtail":
+                bounds.append((0, float(row["wind_forecast_mw"])))
+
+            elif name == "bess_soc":
+                bounds.append(
+                    (
+                        CONFIG["bess_min_soc"],
+                        CONFIG["bess_max_soc"]
+                    )
+                )
+
+            elif name == "ev_soc":
+                bounds.append(
+                    (
+                        CONFIG["ev_min_soc"],
+                        CONFIG["ev_max_soc"]
+                    )
+                )
+
+            elif name == "heat_shortfall":
+                bounds.append((0, float(row["heat_demand_mw"])))
+
+            elif name == "ev_mobility_shortfall":
+                bounds.append((0, float(row["ev_drive_energy_mwh"])))
+
+    result = linprog(
+        c=cost,
+        A_eq=np.array(A_eq),
+        b_eq=np.array(b_eq),
+        A_ub=np.array(A_ub),
+        b_ub=np.array(b_ub),
+        bounds=bounds,
+        method="highs"
+    )
+
+    if not result.success:
+        raise RuntimeError(f"MPC failed: {result.message}")
+
+    x = result.x
+
+    solution = {
+        name: np.array([
+            x[vidx(name, step, horizon)]
+            for step in range(horizon)
+        ])
+        for name in VAR_NAMES
+    }
+
+    solution["objective"] = float(result.fun)
+
+    return solution
+
+# ================================================================
+# 7. BASELINE CASES
+# ================================================================
+
+def simulate_no_flex(dataframe):
+    records = []
+
+    for time_index, row in dataframe.iterrows():
+        demand = row["base_load_mw"] + row["heat_demand_mw"]
+        renewable = row["pv_forecast_mw"] + row["wind_forecast_mw"]
+        net = demand - renewable
+
+        pv_used = min(row["pv_forecast_mw"], demand)
+        wind_used = min(
+            row["wind_forecast_mw"],
+            max(0, demand - pv_used)
+        )
+
+        records.append({
+            "timestamp": row["timestamp"],
+            "case": "No flexibility",
+            "grid_import_mw": max(0, net),
+            "grid_export_mw": max(0, -net),
+            "bess_charge_mw": 0,
+            "bess_discharge_mw": 0,
+            "bess_soc": CONFIG["bess_initial_soc"],
+            "ev_charge_mw": 0,
+            "ev_discharge_mw": 0,
+            "ev_soc": CONFIG["ev_initial_soc"],
+            "heat_pump_mw": row["heat_demand_mw"],
+            "heat_shortfall_mw": 0,
+            "load_shed_mw": 0,
+            "ev_mobility_shortfall_mwh": 0,
+            "pv_used_mw": pv_used,
+            "wind_used_mw": wind_used,
+            "pv_curtailment_mw": max(0, row["pv_forecast_mw"] - pv_used),
+            "wind_curtailment_mw": max(0, row["wind_forecast_mw"] - wind_used),
+            "frequency_support_mw": 0,
+            "grid_support_mode": "NONE",
+            "feeder_stress": time_index == CONFIG["feeder_stress_hour"]
+        })
+
+    return pd.DataFrame(records)
+
+
+def simulate_rule_based(dataframe):
+    records = []
+
+    bess_soc = CONFIG["bess_initial_soc"]
+    ev_soc = CONFIG["ev_initial_soc"]
+
+    eta_bess = math.sqrt(CONFIG["bess_roundtrip_efficiency"])
+
+    for time_index, row in dataframe.iterrows():
+        demand = row["base_load_mw"] + row["heat_demand_mw"]
+        renewable = row["pv_forecast_mw"] + row["wind_forecast_mw"]
+        surplus = renewable - demand
+        hour = row["timestamp"].hour
+
+        bess_charge = 0.0
+        bess_discharge = 0.0
+
+        if surplus > 0:
+            bess_charge = min(
+                CONFIG["bess_power_mw"],
+                surplus,
+                (
+                    CONFIG["bess_max_soc"]
+                    - bess_soc
+                )
+                * CONFIG["bess_energy_mwh"]
+                / eta_bess
+            )
+
+        elif hour in range(17, 22):
+            bess_discharge = min(
+                CONFIG["bess_power_mw"],
+                -surplus,
+                (
+                    bess_soc
+                    - CONFIG["bess_min_soc"]
+                )
+                * CONFIG["bess_energy_mwh"]
+                * eta_bess
+            )
+
+        bess_soc = np.clip(
+            bess_soc
+            + (
+                eta_bess * bess_charge
+                - bess_discharge / eta_bess
+            )
+            / CONFIG["bess_energy_mwh"],
+            CONFIG["bess_min_soc"],
+            CONFIG["bess_max_soc"]
+        )
+
+        net = demand + bess_charge - bess_discharge - renewable
+
+        pv_used = min(row["pv_forecast_mw"], demand + bess_charge)
+        wind_used = min(
+            row["wind_forecast_mw"],
+            max(0, demand + bess_charge - pv_used)
+        )
+
+        records.append({
+            "timestamp": row["timestamp"],
+            "case": "Rule-based BESS",
+            "grid_import_mw": max(0, net),
+            "grid_export_mw": max(0, -net),
+            "bess_charge_mw": bess_charge,
+            "bess_discharge_mw": bess_discharge,
+            "bess_soc": bess_soc,
+            "ev_charge_mw": 0,
+            "ev_discharge_mw": 0,
+            "ev_soc": ev_soc,
+            "heat_pump_mw": row["heat_demand_mw"],
+            "heat_shortfall_mw": 0,
+            "load_shed_mw": 0,
+            "ev_mobility_shortfall_mwh": 0,
+            "pv_used_mw": pv_used,
+            "wind_used_mw": wind_used,
+            "pv_curtailment_mw": max(0, row["pv_forecast_mw"] - pv_used),
+            "wind_curtailment_mw": max(0, row["wind_forecast_mw"] - wind_used),
+            "frequency_support_mw": 0,
+            "grid_support_mode": "RULE_BASED",
+            "feeder_stress": time_index == CONFIG["feeder_stress_hour"]
+        })
+
+    return pd.DataFrame(records)
+
+# ================================================================
+# 8. MPC CASE SIMULATION
+# ================================================================
+
+def apply_grid_support(dataframe, dispatch):
+    controlled = dispatch.copy()
+
+    frequency_error = 50.0 - dataframe["frequency_hz"].to_numpy()
+    frequency_rate = np.gradient(dataframe["frequency_hz"].to_numpy())
+
+    requested_response = (
+        CONFIG["frequency_droop_gain"] * frequency_error
+        - CONFIG["synthetic_inertia_gain"] * frequency_rate
+    )
+
+    available_discharge = (
+        CONFIG["bess_power_mw"]
+        - controlled["bess_discharge_mw"].to_numpy()
+    )
+
+    available_charge = (
+        CONFIG["bess_power_mw"]
+        - controlled["bess_charge_mw"].to_numpy()
+    )
+
+    support = np.where(
+        requested_response >= 0,
+        np.minimum(requested_response, available_discharge),
+        -np.minimum(np.abs(requested_response), available_charge)
+    )
+
+    controlled["frequency_support_mw"] = support
+
+    controlled["grid_support_mode"] = np.where(
+        np.abs(frequency_error) > 0.08,
+        "GRID_SUPPORTIVE",
+        "NORMAL_MPC"
+    )
+
+    return controlled
+
+
+def simulate_mpc_case(dataframe, mode, label):
+    records = []
+
+    bess_soc = CONFIG["bess_initial_soc"]
+    ev_soc = CONFIG["ev_initial_soc"]
+    horizon = CONFIG["mpc_horizon_h"]
+
+    for time_index in range(len(dataframe)):
+        if time_index % 48 == 0:
+            print(f"{label}: solving hour {time_index + 1}/{len(dataframe)}")
+
+        window = dataframe.iloc[
+            time_index:
+            min(time_index + horizon, len(dataframe))
+        ].copy()
+
+        feeder_stress = time_index == CONFIG["feeder_stress_hour"]
+
+        solution = solve_mpc_window(
+            window=window,
+            bess_soc0=bess_soc,
+            ev_soc0=ev_soc,
+            mode=mode,
+            feeder_stress=feeder_stress
+        )
+
+        row = dataframe.iloc[time_index]
+
+        next_bess_soc = float(
+            np.clip(
+                solution["bess_soc"][0],
+                CONFIG["bess_min_soc"],
+                CONFIG["bess_max_soc"]
+            )
+        )
+
+        next_ev_soc = float(
+            np.clip(
+                solution["ev_soc"][0],
+                CONFIG["ev_min_soc"],
+                CONFIG["ev_max_soc"]
+            )
+        )
+
+        record = {
+            "timestamp": row["timestamp"],
+            "case": label,
+
+            "grid_import_mw": max(0, solution["grid_import"][0]),
+            "grid_export_mw": max(0, solution["grid_export"][0]),
+
+            "bess_charge_mw": max(0, solution["bess_charge"][0]),
+            "bess_discharge_mw": max(0, solution["bess_discharge"][0]),
+            "bess_soc": next_bess_soc,
+
+            "ev_charge_mw": max(0, solution["ev_charge"][0]),
+            "ev_discharge_mw": max(0, solution["ev_discharge"][0]),
+            "ev_soc": next_ev_soc,
+
+            "heat_pump_mw": max(0, solution["heat_pump"][0]),
+            "heat_shortfall_mw": max(0, solution["heat_shortfall"][0]),
+            "load_shed_mw": max(0, solution["load_shed"][0]),
+            "ev_mobility_shortfall_mwh": max(
+                0,
+                solution["ev_mobility_shortfall"][0]
+            ),
+
+            "pv_used_mw": max(
+                0,
+                row["pv_forecast_mw"]
+                - solution["pv_curtail"][0]
+            ),
+
+            "wind_used_mw": max(
+                0,
+                row["wind_forecast_mw"]
+                - solution["wind_curtail"][0]
+            ),
+
+            "pv_curtailment_mw": max(0, solution["pv_curtail"][0]),
+            "wind_curtailment_mw": max(0, solution["wind_curtail"][0]),
+
+            "frequency_support_mw": 0,
+            "grid_support_mode": "MPC",
+            "feeder_stress": feeder_stress
+        }
+
+        records.append(record)
+
+        bess_soc = next_bess_soc
+        ev_soc = next_ev_soc
+
+    result = pd.DataFrame(records)
+
+    if mode == "grid_supportive_mpc":
+        result = apply_grid_support(dataframe, result)
+
+    return result
+
+
+print("Running baseline and MPC cases...")
+
+case_no = simulate_no_flex(data)
+case_rule = simulate_rule_based(data)
+
+case_cost = simulate_mpc_case(
+    data,
+    "cost_only_mpc",
+    "Cost-only MPC"
+)
+
+case_degradation = simulate_mpc_case(
+    data,
+    "degradation_aware_mpc",
+    "Degradation-aware MPC"
+)
+
+case_grid_supportive = simulate_mpc_case(
+    data,
+    "grid_supportive_mpc",
+    "Grid-supportive degradation-aware MPC"
+)
+
+all_dispatch = pd.concat(
+    [
+        case_no,
+        case_rule,
+        case_cost,
+        case_degradation,
+        case_grid_supportive
+    ],
+    ignore_index=True
+)
+
+display(
+    all_dispatch.head()
+    .style
+    .background_gradient(cmap="viridis")
+    .format(precision=4)
+)
+
+# ================================================================
+# 9. FAST LINEARIZED FEEDER VALIDATION
+# ================================================================
+
+def validate_linear_feeder(dataframe, dispatch):
+    rows = []
+
+    feeder_r = np.array([
+        0.010,
+        0.012,
+        0.014,
+        0.016,
+        0.018,
+        0.020
+    ])
+
+    feeder_limit_mw = np.array([
+        0.28,
+        0.26,
+        0.24,
+        0.22,
+        0.20,
+        0.18
+    ])
+
+    load_shares = np.array([
+        0.17,
+        0.16,
+        0.18,
+        0.17,
+        0.16,
+        0.16
+    ])
+
+    pv_bus = np.array([
+        0.0,
+        0.45,
+        0.0,
+        0.35,
+        0.0,
+        0.20
+    ])
+
+    wind_bus = np.array([
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+    ])
+
+    for case_name in dispatch["case"].unique():
+        case_dispatch = (
+            dispatch[
+                dispatch["case"] == case_name
+            ]
+            .reset_index(drop=True)
+        )
+
+        for time_index in range(len(dataframe)):
+            row = dataframe.iloc[time_index]
+            control = case_dispatch.iloc[time_index]
+
+            total_load = (
+                row["base_load_mw"]
+                + control["heat_pump_mw"]
+                - control["load_shed_mw"]
+            )
+
+            node_load = total_load * load_shares
+
+            node_generation = (
+                control["pv_used_mw"] * pv_bus
+                + control["wind_used_mw"] * wind_bus
+            )
+
+            storage_net = (
+                control["bess_discharge_mw"]
+                - control["bess_charge_mw"]
+                + control["ev_discharge_mw"]
+                - control["ev_charge_mw"]
+                + control["frequency_support_mw"]
+            )
+
+            node_generation[4] += 0.70 * storage_net
+            node_generation[2] += 0.30 * storage_net
+
+            net_demand = node_load - node_generation
+
+            downstream_flow = np.array([
+                net_demand[index:].sum()
+                for index in range(len(net_demand))
+            ])
+
+            limits = feeder_limit_mw.copy()
+
+            if bool(control["feeder_stress"]):
+                limits[-1] *= 0.40
+
+            loading_percent = (
+                100
+                * np.abs(downstream_flow)
+                / limits
+            )
+
+            voltage = np.ones(7)
+            voltage[0] = 1.01
+
+            for index in range(6):
+                voltage[index + 1] = (
+                    voltage[index]
+                    - feeder_r[index]
+                    * downstream_flow[index]
+                )
+
+            q_support = 0.0
+
+            if (
+                "Grid-supportive" in case_name
+                and
+                (
+                    voltage.min() < 0.97
+                    or control["grid_support_mode"] == "GRID_SUPPORTIVE"
+                )
+            ):
+                q_support = min(
+                    0.08,
+                    max(0, (0.97 - voltage.min()) * 2.0)
+                )
+
+                voltage[1:] += (
+                    np.linspace(0.15, 1.0, 6)
+                    * q_support
+                    * 0.08
+                )
+
+            rows.append({
+                "timestamp": row["timestamp"],
+                "case": case_name,
+                "linear_minimum_voltage_pu": float(voltage.min()),
+                "linear_maximum_voltage_pu": float(voltage.max()),
+                "linear_maximum_line_loading_percent": float(loading_percent.max()),
+                "linear_transformer_loading_percent": float(
+                    100
+                    * abs(downstream_flow[0])
+                    / CONFIG["grid_connection_mw"]
+                ),
+                "feeder_stress_active": bool(control["feeder_stress"]),
+                "reactive_support_mvar": q_support
+            })
+
+    return pd.DataFrame(rows)
+
+
+linear_grid_results = validate_linear_feeder(
+    data,
+    all_dispatch
+)
+
+# ================================================================
+# 10. pandapower AC VALIDATION
+# ================================================================
+
+def create_pandapower_network():
+    net = pp.create_empty_network(sn_mva=1.0)
+
+    bus_hv = pp.create_bus(net, vn_kv=20.0, name="MV Grid")
+    bus_lv0 = pp.create_bus(net, vn_kv=0.4, name="LV Transformer Bus")
+
+    pp.create_ext_grid(net, bus=bus_hv, vm_pu=1.02, name="External Grid")
+
+    pp.create_transformer_from_parameters(
+        net,
+        hv_bus=bus_hv,
+        lv_bus=bus_lv0,
+        sn_mva=1.0,
+        vn_hv_kv=20.0,
+        vn_lv_kv=0.4,
+        vk_percent=6.0,
+        vkr_percent=1.0,
+        pfe_kw=1.2,
+        i0_percent=0.2,
+        name="20/0.4 kV Transformer"
+    )
+
+    buses = [bus_lv0]
+
+    for i in range(1, 7):
+        buses.append(
+            pp.create_bus(
+                net,
+                vn_kv=0.4,
+                name=f"LV Bus {i}"
+            )
+        )
+
+    for i in range(6):
+        pp.create_line_from_parameters(
+            net,
+            from_bus=buses[i],
+            to_bus=buses[i + 1],
+            length_km=0.12,
+            r_ohm_per_km=0.642,
+            x_ohm_per_km=0.083,
+            c_nf_per_km=210,
+            max_i_ka=0.32,
+            name=f"LV Line {i + 1}"
+        )
+
+    return net, buses
+
+
+def run_pandapower_hour(row, control):
+    if not PANDAPOWER_AVAILABLE:
+        return {
+            "pandapower_success": False,
+            "pp_minimum_voltage_pu": np.nan,
+            "pp_maximum_voltage_pu": np.nan,
+            "pp_maximum_line_loading_percent": np.nan,
+            "pp_transformer_loading_percent": np.nan
+        }
+
+    try:
+        net, buses = create_pandapower_network()
+
+        load_shares = np.array([
+            0.17,
+            0.16,
+            0.18,
+            0.17,
+            0.16,
+            0.16
+        ])
+
+        total_load = (
+            row["base_load_mw"]
+            + control["heat_pump_mw"]
+            - control["load_shed_mw"]
+        )
+
+        for i, share in enumerate(load_shares, start=1):
+            pp.create_load(
+                net,
+                bus=buses[i],
+                p_mw=float(total_load * share),
+                q_mvar=float(total_load * share * 0.32),
+                name=f"Load Bus {i}"
+            )
+
+        pv_allocation = {
+            2: 0.45,
+            4: 0.35,
+            6: 0.20
+        }
+
+        for bus_index, share in pv_allocation.items():
+            pp.create_sgen(
+                net,
+                bus=buses[bus_index],
+                p_mw=float(control["pv_used_mw"] * share),
+                q_mvar=0.0,
+                name=f"PV Bus {bus_index}"
+            )
+
+        pp.create_sgen(
+            net,
+            bus=buses[6],
+            p_mw=float(control["wind_used_mw"]),
+            q_mvar=0.0,
+            name="Wind Equivalent"
+        )
+
+        storage_net = (
+            control["bess_discharge_mw"]
+            - control["bess_charge_mw"]
+            + control["ev_discharge_mw"]
+            - control["ev_charge_mw"]
+            + control["frequency_support_mw"]
+        )
+
+        if storage_net >= 0:
+            pp.create_sgen(
+                net,
+                bus=buses[5],
+                p_mw=float(storage_net),
+                q_mvar=float(-control["reactive_support_mvar"] if "reactive_support_mvar" in control else 0),
+                name="BESS/EV Net Injection"
+            )
+        else:
+            pp.create_load(
+                net,
+                bus=buses[5],
+                p_mw=float(abs(storage_net)),
+                q_mvar=0.0,
+                name="BESS/EV Net Charging"
+            )
+
+        pp.runpp(
+            net,
+            algorithm="nr",
+            max_iteration=30,
+            tolerance_mva=1e-6,
+            init="auto"
+        )
+
+        return {
+            "pandapower_success": bool(net.converged),
+            "pp_minimum_voltage_pu": float(net.res_bus.vm_pu.min()),
+            "pp_maximum_voltage_pu": float(net.res_bus.vm_pu.max()),
+            "pp_maximum_line_loading_percent": float(net.res_line.loading_percent.max()),
+            "pp_transformer_loading_percent": float(net.res_trafo.loading_percent.max())
+        }
+
+    except Exception:
+        return {
+            "pandapower_success": False,
+            "pp_minimum_voltage_pu": np.nan,
+            "pp_maximum_voltage_pu": np.nan,
+            "pp_maximum_line_loading_percent": np.nan,
+            "pp_transformer_loading_percent": np.nan
+        }
+
+
+def validate_pandapower_ac(dataframe, dispatch):
+    rows = []
+
+    print("Running pandapower AC validation...")
+
+    dispatch_with_linear = dispatch.merge(
+        linear_grid_results,
+        on=["timestamp", "case"],
+        how="left"
+    )
+
+    for case_name in dispatch_with_linear["case"].unique():
+        case_dispatch = (
+            dispatch_with_linear[
+                dispatch_with_linear["case"] == case_name
+            ]
+            .reset_index(drop=True)
+        )
+
+        for time_index in range(len(dataframe)):
+            if time_index % 72 == 0:
+                print(f"pandapower: {case_name}, hour {time_index + 1}/{len(dataframe)}")
+
+            row = dataframe.iloc[time_index]
+            control = case_dispatch.iloc[time_index]
+
+            result = run_pandapower_hour(row, control)
+
+            result.update({
+                "timestamp": row["timestamp"],
+                "case": case_name
+            })
+
+            rows.append(result)
+
+    return pd.DataFrame(rows)
+
+
+pandapower_results = validate_pandapower_ac(
+    data,
+    all_dispatch
+)
+
+# ================================================================
+# 11. OPTIONAL OpenDSS UNBALANCED FEEDER VALIDATION
+# ================================================================
+
+def run_opendss_hour(row, control):
+    if not OPENDSS_AVAILABLE:
+        return {
+            "opendss_success": False,
+            "dss_minimum_voltage_pu": np.nan,
+            "dss_maximum_voltage_pu": np.nan,
+            "dss_note": "OpenDSSDirect not available"
+        }
+
+    try:
+        dss.Text.Command("Clear")
+        dss.Text.Command("New Circuit.FreiburgLV basekv=0.4 pu=1.02 phases=3 bus1=sourcebus")
+        dss.Text.Command("Edit Vsource.Source basekv=0.4 pu=1.02 phases=3 angle=0 frequency=50")
+        dss.Text.Command("New Linecode.LVCode nphases=3 r1=0.642 x1=0.083 r0=0.842 x0=0.123 units=km normamps=320")
+
+        for i in range(6):
+            from_bus = "sourcebus" if i == 0 else f"bus{i}"
+            to_bus = f"bus{i + 1}"
+            dss.Text.Command(
+                f"New Line.L{i + 1} phases=3 bus1={from_bus}.1.2.3 "
+                f"bus2={to_bus}.1.2.3 linecode=LVCode length=0.12 units=km"
+            )
+
+        load_shares = np.array([
+            0.17,
+            0.16,
+            0.18,
+            0.17,
+            0.16,
+            0.16
+        ])
+
+        phase_weights = [
+            [0.45, 0.32, 0.23],
+            [0.25, 0.47, 0.28],
+            [0.30, 0.25, 0.45],
+            [0.50, 0.20, 0.30],
+            [0.20, 0.55, 0.25],
+            [0.33, 0.27, 0.40]
+        ]
+
+        total_load_kw = 1000 * (
+            row["base_load_mw"]
+            + control["heat_pump_mw"]
+            - control["load_shed_mw"]
+        )
+
+        for bus_i in range(1, 7):
+            bus_load_kw = total_load_kw * load_shares[bus_i - 1]
+
+            for phase in [1, 2, 3]:
+                kw = bus_load_kw * phase_weights[bus_i - 1][phase - 1]
+                kvar = 0.32 * kw
+                dss.Text.Command(
+                    f"New Load.Load_bus{bus_i}_ph{phase} "
+                    f"bus1=bus{bus_i}.{phase} phases=1 conn=wye "
+                    f"kv=0.23 kw={kw:.5f} kvar={kvar:.5f}"
+                )
+
+        pv_kw = 1000 * float(control["pv_used_mw"])
+        wind_kw = 1000 * float(control["wind_used_mw"])
+
+        dss.Text.Command(
+            f"New Generator.PV_bus2 bus1=bus2.1.2.3 phases=3 kv=0.4 kw={0.45 * pv_kw:.5f} kvar=0 model=1"
+        )
+        dss.Text.Command(
+            f"New Generator.PV_bus4 bus1=bus4.1.2.3 phases=3 kv=0.4 kw={0.35 * pv_kw:.5f} kvar=0 model=1"
+        )
+        dss.Text.Command(
+            f"New Generator.PV_bus6 bus1=bus6.1.2.3 phases=3 kv=0.4 kw={0.20 * pv_kw:.5f} kvar=0 model=1"
+        )
+        dss.Text.Command(
+            f"New Generator.Wind_bus6 bus1=bus6.1.2.3 phases=3 kv=0.4 kw={wind_kw:.5f} kvar=0 model=1"
+        )
+
+        storage_net_kw = 1000 * (
+            control["bess_discharge_mw"]
+            - control["bess_charge_mw"]
+            + control["ev_discharge_mw"]
+            - control["ev_charge_mw"]
+            + control["frequency_support_mw"]
+        )
+
+        if storage_net_kw >= 0:
+            dss.Text.Command(
+                f"New Generator.StorageEquivalent bus1=bus5.1.2.3 phases=3 kv=0.4 "
+                f"kw={storage_net_kw:.5f} kvar=0 model=1"
+            )
+        else:
+            dss.Text.Command(
+                f"New Load.StorageCharging bus1=bus5.1.2.3 phases=3 conn=wye kv=0.4 "
+                f"kw={abs(storage_net_kw):.5f} kvar=0"
+            )
+
+        dss.Text.Command("Set Voltagebases=[0.4]")
+        dss.Text.Command("CalcVoltageBases")
+        dss.Text.Command("Solve")
+
+        pu_voltages = np.array(dss.Circuit.AllBusMagPu(), dtype=float)
+        pu_voltages = pu_voltages[np.isfinite(pu_voltages)]
+
+        if len(pu_voltages) == 0:
+            raise RuntimeError("No OpenDSS voltages returned")
+
+        return {
+            "opendss_success": True,
+            "dss_minimum_voltage_pu": float(np.min(pu_voltages)),
+            "dss_maximum_voltage_pu": float(np.max(pu_voltages)),
+            "dss_note": "Unbalanced 3-phase OpenDSS validation completed"
+        }
+
+    except Exception as error:
+        return {
+            "opendss_success": False,
+            "dss_minimum_voltage_pu": np.nan,
+            "dss_maximum_voltage_pu": np.nan,
+            "dss_note": str(error)[:150]
+        }
+
+
+def validate_opendss_unbalanced(dataframe, dispatch):
+    rows = []
+
+    if not RUN_OPENDSS_VALIDATION:
+        return pd.DataFrame(columns=[
+            "timestamp",
+            "case",
+            "opendss_success",
+            "dss_minimum_voltage_pu",
+            "dss_maximum_voltage_pu",
+            "dss_note"
+        ])
+
+    print("Running optional OpenDSS unbalanced validation...")
+
+    # To control runtime, validate the strongest case hourly and all other cases every 6 hours.
+    for case_name in dispatch["case"].unique():
+        case_dispatch = (
+            dispatch[
+                dispatch["case"] == case_name
+            ]
+            .reset_index(drop=True)
+        )
+
+        for time_index in range(len(dataframe)):
+            validate_this_hour = (
+                case_name == "Grid-supportive degradation-aware MPC"
+                or time_index % 6 == 0
+                or time_index == CONFIG["feeder_stress_hour"]
+            )
+
+            if not validate_this_hour:
+                continue
+
+            if time_index % 72 == 0:
+                print(f"OpenDSS: {case_name}, hour {time_index + 1}/{len(dataframe)}")
+
+            row = dataframe.iloc[time_index]
+            control = case_dispatch.iloc[time_index]
+
+            result = run_opendss_hour(row, control)
+
+            result.update({
+                "timestamp": row["timestamp"],
+                "case": case_name
+            })
+
+            rows.append(result)
+
+    return pd.DataFrame(rows)
+
+
+opendss_results = validate_opendss_unbalanced(
+    data,
+    all_dispatch
+)
+
+# ================================================================
+# 12. MERGE VALIDATION RESULTS
+# ================================================================
+
+all_results = all_dispatch.merge(
+    linear_grid_results,
+    on=["timestamp", "case"],
+    how="left"
+)
+
+all_results = all_results.merge(
+    pandapower_results,
+    on=["timestamp", "case"],
+    how="left"
+)
+
+if not opendss_results.empty:
+    all_results = all_results.merge(
+        opendss_results,
+        on=["timestamp", "case"],
+        how="left"
+    )
+else:
+    all_results["opendss_success"] = False
+    all_results["dss_minimum_voltage_pu"] = np.nan
+    all_results["dss_maximum_voltage_pu"] = np.nan
+    all_results["dss_note"] = "OpenDSS validation not executed"
+
+# ================================================================
+# 13. RAINFLOW BATTERY DEGRADATION MODEL
+# ================================================================
+
+def fallback_rainflow_cycles(soc_series):
+    """
+    Basic fallback if rainflow package fails.
+    It approximates cycles from SOC step changes.
+    """
+    soc = np.asarray(soc_series, dtype=float)
+    ranges = np.abs(np.diff(soc))
+    ranges = ranges[ranges > 1e-5]
+
+    cycles = []
+
+    for r in ranges:
+        cycles.append({
+            "range": float(r),
+            "mean": float(np.mean(soc)),
+            "count": 0.5
+        })
+
+    return cycles
+
+
+def extract_rainflow_cycles(soc_series):
+    soc = np.asarray(soc_series, dtype=float)
+
+    if len(soc) < 3:
+        return []
+
+    if RAINFLOW_AVAILABLE:
+        try:
+            cycles = []
+
+            for cycle in rainflow.extract_cycles(soc):
+                # Standard package returns:
+                # range, mean, count, i_start, i_end
+                rng, mean, count, i_start, i_end = cycle
+
+                cycles.append({
+                    "range": float(rng),
+                    "mean": float(mean),
+                    "count": float(count),
+                    "i_start": int(i_start),
+                    "i_end": int(i_end)
+                })
+
+            return cycles
+
+        except Exception:
+            return fallback_rainflow_cycles(soc)
+
+    return fallback_rainflow_cycles(soc)
+
+
+def rainflow_degradation_for_case(dispatch):
+    soc = dispatch["bess_soc"].to_numpy(dtype=float)
+    cycles = extract_rainflow_cycles(soc)
+
+    if len(cycles) == 0:
+        rainflow_equivalent_cycles = 0.0
+        rainflow_damage = 0.0
+        avg_cycle_range = 0.0
+        max_cycle_range = 0.0
+    else:
+        cycle_ranges = np.array([c["range"] for c in cycles], dtype=float)
+        cycle_counts = np.array([c["count"] for c in cycles], dtype=float)
+
+        # Equivalent full cycles from rainflow ranges.
+        rainflow_equivalent_cycles = float(
+            np.sum(cycle_ranges * cycle_counts)
+        )
+
+        # Damage model:
+        # deeper cycles are penalized nonlinearly.
+        rainflow_damage = float(
+            np.sum((cycle_ranges ** 1.35) * cycle_counts)
+            / CONFIG["bess_cycle_life_reference"]
+        )
+
+        avg_cycle_range = float(
+            np.average(cycle_ranges, weights=np.maximum(cycle_counts, 1e-9))
+        )
+
+        max_cycle_range = float(np.max(cycle_ranges))
+
+    throughput_mwh = (
+        dispatch["bess_charge_mw"]
+        + dispatch["bess_discharge_mw"]
+    ).sum()
+
+    equivalent_full_cycles_throughput = (
+        throughput_mwh
+        / (
+            2
+            * CONFIG["bess_energy_mwh"]
+        )
+    )
+
+    average_temperature = data["ambient_temperature_c"].mean()
+
+    temperature_factor = np.exp(
+        0.035 * (average_temperature - 20)
+    )
+
+    cycle_loss_percent = 100 * rainflow_damage
+
+    calendar_loss_percent = (
+        2.0
+        * (len(data) / 24)
+        / 365
+        * temperature_factor
+    )
+
+    total_loss_percent = (
+        cycle_loss_percent
+        + calendar_loss_percent
+    )
+
+    replacement_cost = (
+        CONFIG["battery_replacement_eur_per_kwh"]
+        * CONFIG["bess_energy_mwh"]
+        * 1000
+    )
+
+    degradation_cost = (
+        replacement_cost
+        * total_loss_percent
+        / 100
+    )
+
+    return {
+        "throughput_mwh": throughput_mwh,
+        "throughput_equivalent_full_cycles": equivalent_full_cycles_throughput,
+        "rainflow_equivalent_cycles": rainflow_equivalent_cycles,
+        "rainflow_cycle_count_events": len(cycles),
+        "average_rainflow_cycle_range_soc": avg_cycle_range,
+        "maximum_rainflow_cycle_range_soc": max_cycle_range,
+        "cycle_loss_percent": cycle_loss_percent,
+        "calendar_loss_percent": calendar_loss_percent,
+        "total_capacity_loss_percent": total_loss_percent,
+        "state_of_health_percent": max(0, 100 - total_loss_percent),
+        "degradation_cost_eur": degradation_cost
+    }
+
+
+def kpis_for_case(dataframe, dispatch):
+    degradation = rainflow_degradation_for_case(dispatch)
+
+    import_cost = (
+        dispatch["grid_import_mw"].to_numpy()
+        * dataframe["import_price_eur_per_kwh"].to_numpy()
+        * 1000
+    ).sum()
+
+    export_revenue = (
+        dispatch["grid_export_mw"].to_numpy()
+        * dataframe["feed_in_tariff_eur_per_kwh"].to_numpy()
+        * 1000
+    ).sum()
+
+    emissions = (
+        dispatch["grid_import_mw"].to_numpy()
+        * dataframe["grid_carbon_kg_per_kwh"].to_numpy()
+        * 1000
+    ).sum()
+
+    carbon_cost = (
+        emissions
+        / 1000
+        * CONFIG["carbon_price_eur_per_tonne"]
+    )
+
+    renewable_used = (
+        dispatch["pv_used_mw"]
+        + dispatch["wind_used_mw"]
+    ).sum()
+
+    renewable_available = (
+        dataframe["pv_forecast_mw"]
+        + dataframe["wind_forecast_mw"]
+    ).sum()
+
+    total_demand = (
+        dataframe["base_load_mw"].to_numpy()
+        + dispatch["heat_pump_mw"].to_numpy()
+        - dispatch["load_shed_mw"].to_numpy()
+    ).sum()
+
+    pp_voltage_violations = (
+        (
+            dispatch["pp_minimum_voltage_pu"]
+            < CONFIG["voltage_min_pu"]
+        )
+        |
+        (
+            dispatch["pp_maximum_voltage_pu"]
+            > CONFIG["voltage_max_pu"]
+        )
+    ).sum()
+
+    pp_congestion_hours = (
+        dispatch["pp_maximum_line_loading_percent"]
+        > 100
+    ).sum()
+
+    linear_voltage_violations = (
+        (
+            dispatch["linear_minimum_voltage_pu"]
+            < CONFIG["voltage_min_pu"]
+        )
+        |
+        (
+            dispatch["linear_maximum_voltage_pu"]
+            > CONFIG["voltage_max_pu"]
+        )
+    ).sum()
+
+    linear_congestion_hours = (
+        dispatch["linear_maximum_line_loading_percent"]
+        > 100
+    ).sum()
+
+    return {
+        "case": dispatch["case"].iloc[0],
+        "net_energy_cost_eur": import_cost - export_revenue,
+        "carbon_cost_eur": carbon_cost,
+        "grid_emissions_kgco2": emissions,
+        "grid_import_mwh": dispatch["grid_import_mw"].sum(),
+        "grid_export_mwh": dispatch["grid_export_mw"].sum(),
+        "peak_grid_import_kw": 1000 * dispatch["grid_import_mw"].max(),
+        "renewable_utilization_percent": (
+            100
+            * renewable_used
+            / max(renewable_available, 1e-9)
+        ),
+        "self_sufficiency_percent": (
+            100
+            * (
+                1
+                - dispatch["grid_import_mw"].sum()
+                / max(total_demand, 1e-9)
+            )
+        ),
+        "rainflow_equivalent_cycles": degradation["rainflow_equivalent_cycles"],
+        "rainflow_cycle_events": degradation["rainflow_cycle_count_events"],
+        "bess_degradation_cost_eur": degradation["degradation_cost_eur"],
+        "bess_soh_percent": degradation["state_of_health_percent"],
+        "linear_voltage_violations": int(linear_voltage_violations),
+        "linear_congestion_hours": int(linear_congestion_hours),
+        "pandapower_voltage_violations": int(pp_voltage_violations),
+        "pandapower_congestion_hours": int(pp_congestion_hours),
+        "unserved_energy_kwh": 1000 * dispatch["load_shed_mw"].sum(),
+        "heat_shortfall_kwh": 1000 * dispatch["heat_shortfall_mw"].sum(),
+        "ev_mobility_shortfall_kwh": (
+            1000
+            * dispatch["ev_mobility_shortfall_mwh"].sum()
+        ),
+        "grid_support_hours": int(
+            (
+                dispatch["grid_support_mode"]
+                == "GRID_SUPPORTIVE"
+            ).sum()
+        )
+    }
+
+
+kpi_rows = []
+degradation_rows = []
+
+for case_name in all_results["case"].unique():
+    case_dispatch = (
+        all_results[
+            all_results["case"] == case_name
+        ]
+        .reset_index(drop=True)
+    )
+
+    kpi_rows.append(
+        kpis_for_case(
+            data,
+            case_dispatch
+        )
+    )
+
+    degradation = rainflow_degradation_for_case(case_dispatch)
+    degradation["case"] = case_name
+    degradation_rows.append(degradation)
+
+kpi_table = pd.DataFrame(kpi_rows)
+degradation_table = pd.DataFrame(degradation_rows)
+
+display(HTML("""
+<div style="
+padding:15px;
+border-radius:15px;
+background:linear-gradient(90deg,#0d47a1,#00b0ff);
+color:white;
+font-family:Arial;
+">
+<h2 style="margin:0;">📊 Baseline Comparison with Rainflow Degradation and AC Validation</h2>
+</div>
+"""))
+
+display(
+    kpi_table
+    .style
+    .background_gradient(
+        cmap="RdYlGn_r",
+        subset=[
+            "net_energy_cost_eur",
+            "grid_emissions_kgco2",
+            "peak_grid_import_kw",
+            "bess_degradation_cost_eur",
+            "pandapower_voltage_violations",
+            "pandapower_congestion_hours"
+        ]
+    )
+    .format(precision=3)
+)
+
+display(
+    degradation_table
+    .style
+    .background_gradient(cmap="plasma")
+    .format(precision=5)
+)
+
+# ================================================================
+# 14. SCADA ALARMS
+# ================================================================
+
+def generate_alarms(results):
+    alarms = []
+
+    for row in results.itertuples():
+        if row.feeder_stress_active:
+            alarms.append([
+                row.timestamp,
+                row.case,
+                "HIGH",
+                "FEEDER_STRESS_EVENT",
+                "Feeder stress derating active"
+            ])
+
+        if row.pp_minimum_voltage_pu < CONFIG["voltage_min_pu"]:
+            alarms.append([
+                row.timestamp,
+                row.case,
+                "HIGH",
+                "PANDAPOWER_UNDERVOLTAGE",
+                f"pandapower minimum voltage {row.pp_minimum_voltage_pu:.3f} pu"
+            ])
+
+        if row.pp_maximum_voltage_pu > CONFIG["voltage_max_pu"]:
+            alarms.append([
+                row.timestamp,
+                row.case,
+                "HIGH",
+                "PANDAPOWER_OVERVOLTAGE",
+                f"pandapower maximum voltage {row.pp_maximum_voltage_pu:.3f} pu"
+            ])
+
+        if row.pp_maximum_line_loading_percent > 100:
+            alarms.append([
+                row.timestamp,
+                row.case,
+                "HIGH",
+                "PANDAPOWER_FEEDER_CONGESTION",
+                f"pandapower feeder loading {row.pp_maximum_line_loading_percent:.1f}%"
+            ])
+
+        if row.linear_minimum_voltage_pu < CONFIG["voltage_min_pu"]:
+            alarms.append([
+                row.timestamp,
+                row.case,
+                "MEDIUM",
+                "LINEAR_UNDERVOLTAGE",
+                f"linear minimum voltage {row.linear_minimum_voltage_pu:.3f} pu"
+            ])
+
+        if row.bess_soc < 0.18:
+            alarms.append([
+                row.timestamp,
+                row.case,
+                "MEDIUM",
+                "BESS_LOW_SOC",
+                f"BESS SOC {100 * row.bess_soc:.1f}%"
+            ])
+
+        if row.load_shed_mw > 1e-5:
+            alarms.append([
+                row.timestamp,
+                row.case,
+                "CRITICAL",
+                "LOAD_SHEDDING",
+                f"Load shed {1000 * row.load_shed_mw:.2f} kW"
+            ])
+
+        if row.grid_support_mode == "GRID_SUPPORTIVE":
+            alarms.append([
+                row.timestamp,
+                row.case,
+                "INFO",
+                "GRID_SUPPORTIVE_MODE",
+                "Simplified droop response active"
+            ])
+
+    return pd.DataFrame(
+        alarms,
+        columns=[
+            "timestamp",
+            "case",
+            "severity",
+            "alarm_code",
+            "message"
+        ]
+    )
+
+
+alarms = generate_alarms(all_results)
+
+display(HTML("""
+<div style="
+padding:15px;
+border-radius:15px;
+background:linear-gradient(90deg,#b71c1c,#ff6f00);
+color:white;
+font-family:Arial;
+">
+<h2 style="margin:0;">🚨 SCADA Alarm Console</h2>
+</div>
+"""))
+
+if alarms.empty:
+    display(HTML("""
+    <div style="
+    padding:15px;
+    background:#c8e6c9;
+    color:#1b5e20;
+    border-radius:12px;
+    font-weight:bold;
+    ">
+    ✅ No active alarms
+    </div>
+    """))
+else:
+    def alarm_style(value):
+        if value == "CRITICAL":
+            return "background-color:#d50000;color:white;font-weight:bold"
+        if value == "HIGH":
+            return "background-color:#ff6d00;color:white;font-weight:bold"
+        if value == "MEDIUM":
+            return "background-color:#ffd600;color:#212121;font-weight:bold"
+        if value == "INFO":
+            return "background-color:#00b0ff;color:white"
+        return ""
+
+    display(
+        alarms.head(60)
+        .style
+        .map(
+            alarm_style,
+            subset=["severity"]
+        )
+    )
+
+# ================================================================
+# 15. SCENARIO STRESS TEST
+# ================================================================
+
+SCENARIOS = {
+    "Sunny_Low_Load": {
+        "probability": 0.25,
+        "load": 0.94,
+        "pv": 1.12,
+        "wind": 1.00,
+        "price": 0.95
+    },
+    "Base": {
+        "probability": 0.50,
+        "load": 1.00,
+        "pv": 1.00,
+        "wind": 1.00,
+        "price": 1.00
+    },
+    "Cloudy_Peak_Load": {
+        "probability": 0.25,
+        "load": 1.08,
+        "pv": 0.72,
+        "wind": 0.88,
+        "price": 1.15
+    }
+}
+
+scenario_rows = []
+
+for scenario_name, parameters in SCENARIOS.items():
+    scenario_data = data.iloc[:min(24, len(data))].copy()
+
+    scenario_data["load_forecast_mw"] *= parameters["load"]
+    scenario_data["pv_forecast_mw"] *= parameters["pv"]
+    scenario_data["wind_forecast_mw"] *= parameters["wind"]
+    scenario_data["price_forecast_eur_per_kwh"] *= parameters["price"]
+
+    scenario_dispatch = simulate_mpc_case(
+        scenario_data,
+        "degradation_aware_mpc",
+        "Degradation-aware MPC"
+    )
+
+    scenario_rows.append({
+        "scenario": scenario_name,
+        "probability": parameters["probability"],
+        "grid_import_mwh": scenario_dispatch["grid_import_mw"].sum(),
+        "grid_export_mwh": scenario_dispatch["grid_export_mw"].sum(),
+        "peak_import_mw": scenario_dispatch["grid_import_mw"].max(),
+        "load_shed_kwh": 1000 * scenario_dispatch["load_shed_mw"].sum(),
+        "ending_bess_soc_percent": 100 * scenario_dispatch["bess_soc"].iloc[-1],
+        "ending_ev_soc_percent": 100 * scenario_dispatch["ev_soc"].iloc[-1]
+    })
+
+scenario_results = pd.DataFrame(scenario_rows)
+
+display(
+    scenario_results
+    .style
+    .background_gradient(cmap="plasma")
+    .format(precision=3)
+)
+
+# ================================================================
+# 16. COLORFUL DASHBOARDS
+# ================================================================
+
+main_case = "Grid-supportive degradation-aware MPC"
+
+main_results = (
+    all_results[
+        all_results["case"] == main_case
+    ]
+    .reset_index(drop=True)
+)
+
+dispatch_plot = pd.DataFrame({
+    "timestamp": data["timestamp"],
+    "District demand": data["base_load_mw"] + main_results["heat_pump_mw"],
+    "Solar PV": main_results["pv_used_mw"],
+    "Wind": main_results["wind_used_mw"],
+    "Grid import": main_results["grid_import_mw"],
+    "BESS discharge": main_results["bess_discharge_mw"],
+    "EV discharge": main_results["ev_discharge_mw"],
+    "Frequency support": main_results["frequency_support_mw"].clip(lower=0)
+})
+
+dispatch_long = dispatch_plot.melt(
+    id_vars="timestamp",
+    var_name="Energy Source",
+    value_name="Power (MW)"
+)
+
+fig_dispatch = px.area(
+    dispatch_long,
+    x="timestamp",
+    y="Power (MW)",
+    color="Energy Source",
+    color_discrete_sequence=px.colors.qualitative.Vivid,
+    title=f"⚡ EnergieQuartier MPC — {SIMULATION_DAYS}-Day Dispatch with Freiburg Weather"
+)
+
+fig_dispatch.update_layout(
+    template="plotly_dark",
+    height=650,
+    hovermode="x unified",
+    legend_orientation="h"
+)
+
+fig_dispatch.show()
+
+fig_dispatch.write_html(
+    OUTPUT_DIR / "01_dispatch_dashboard.html"
+)
+
+fig_kpi = px.bar(
+    kpi_table,
+    x="case",
+    y=[
+        "net_energy_cost_eur",
+        "grid_emissions_kgco2",
+        "peak_grid_import_kw"
+    ],
+    barmode="group",
+    color_discrete_sequence=px.colors.qualitative.Bold,
+    title="📊 Baseline Comparison: Cost, CO₂ and Peak Import"
+)
+
+fig_kpi.update_layout(
+    template="plotly_dark",
+    height=650,
+    xaxis_tickangle=-25
+)
+
+fig_kpi.show()
+
+fig_kpi.write_html(
+    OUTPUT_DIR / "02_baseline_comparison.html"
+)
+
+fig_soc = make_subplots(
+    rows=3,
+    cols=1,
+    shared_xaxes=True,
+    subplot_titles=(
+        "BESS and EV State of Charge",
+        "Battery Power and Frequency Support",
+        "Rainflow-Relevant BESS SOC Movement"
+    )
+)
+
+fig_soc.add_trace(
+    go.Scatter(
+        x=main_results["timestamp"],
+        y=100 * main_results["bess_soc"],
+        name="BESS SOC (%)",
+        line=dict(color="#00e676", width=3)
+    ),
+    row=1,
+    col=1
+)
+
+fig_soc.add_trace(
+    go.Scatter(
+        x=main_results["timestamp"],
+        y=100 * main_results["ev_soc"],
+        name="EV SOC (%)",
+        line=dict(color="#2979ff", width=3)
+    ),
+    row=1,
+    col=1
+)
+
+fig_soc.add_trace(
+    go.Bar(
+        x=main_results["timestamp"],
+        y=(
+            main_results["bess_discharge_mw"]
+            - main_results["bess_charge_mw"]
+        ),
+        name="BESS net output",
+        marker_color="#ffab00"
+    ),
+    row=2,
+    col=1
+)
+
+fig_soc.add_trace(
+    go.Scatter(
+        x=main_results["timestamp"],
+        y=main_results["frequency_support_mw"],
+        name="Frequency support",
+        line=dict(color="#ff1744", width=3)
+    ),
+    row=2,
+    col=1
+)
+
+fig_soc.add_trace(
+    go.Scatter(
+        x=main_results["timestamp"],
+        y=main_results["bess_soc"].diff().fillna(0).abs(),
+        name="Absolute SOC step",
+        fill="tozeroy",
+        line=dict(color="#d500f9", width=2)
+    ),
+    row=3,
+    col=1
+)
+
+fig_soc.update_layout(
+    template="plotly_dark",
+    height=850,
+    hovermode="x unified"
+)
+
+fig_soc.show()
+
+fig_soc.write_html(
+    OUTPUT_DIR / "03_storage_frequency_rainflow_dashboard.html"
+)
+
+fig_grid = make_subplots(
+    rows=4,
+    cols=1,
+    shared_xaxes=True,
+    subplot_titles=(
+        "pandapower AC Voltage Envelope",
+        "pandapower AC Feeder Loading",
+        "Linear Feeder Voltage Envelope",
+        "Optional OpenDSS Unbalanced Voltage Points"
+    )
+)
+
+fig_grid.add_trace(
+    go.Scatter(
+        x=main_results["timestamp"],
+        y=main_results["pp_maximum_voltage_pu"],
+        name="pandapower max voltage",
+        line=dict(color="#00e5ff", width=3)
+    ),
+    row=1,
+    col=1
+)
+
+fig_grid.add_trace(
+    go.Scatter(
+        x=main_results["timestamp"],
+        y=main_results["pp_minimum_voltage_pu"],
+        name="pandapower min voltage",
+        fill="tonexty",
+        line=dict(color="#d500f9", width=3)
+    ),
+    row=1,
+    col=1
+)
+
+fig_grid.add_hline(
+    y=CONFIG["voltage_min_pu"],
+    line_dash="dash",
+    line_color="#ffea00",
+    row=1,
+    col=1
+)
+
+fig_grid.add_hline(
+    y=CONFIG["voltage_max_pu"],
+    line_dash="dash",
+    line_color="#ffea00",
+    row=1,
+    col=1
+)
+
+fig_grid.add_trace(
+    go.Bar(
+        x=main_results["timestamp"],
+        y=main_results["pp_maximum_line_loading_percent"],
+        name="pandapower line loading (%)",
+        marker=dict(
+            color=main_results["pp_maximum_line_loading_percent"],
+            colorscale="Turbo"
+        )
+    ),
+    row=2,
+    col=1
+)
+
+fig_grid.add_hline(
+    y=100,
+    line_dash="dash",
+    line_color="#ff1744",
+    row=2,
+    col=1
+)
+
+fig_grid.add_trace(
+    go.Scatter(
+        x=main_results["timestamp"],
+        y=main_results["linear_maximum_voltage_pu"],
+        name="linear max voltage",
+        line=dict(color="#00e676", width=2)
+    ),
+    row=3,
+    col=1
+)
+
+fig_grid.add_trace(
+    go.Scatter(
+        x=main_results["timestamp"],
+        y=main_results["linear_minimum_voltage_pu"],
+        name="linear min voltage",
+        line=dict(color="#ffab00", width=2)
+    ),
+    row=3,
+    col=1
+)
+
+if "dss_minimum_voltage_pu" in main_results.columns:
+    fig_grid.add_trace(
+        go.Scatter(
+            x=main_results["timestamp"],
+            y=main_results["dss_minimum_voltage_pu"],
+            name="OpenDSS min voltage",
+            mode="markers",
+            marker=dict(color="#ff1744", size=7)
+        ),
+        row=4,
+        col=1
+    )
+
+    fig_grid.add_trace(
+        go.Scatter(
+            x=main_results["timestamp"],
+            y=main_results["dss_maximum_voltage_pu"],
+            name="OpenDSS max voltage",
+            mode="markers",
+            marker=dict(color="#00e5ff", size=7)
+        ),
+        row=4,
+        col=1
+    )
+
+fig_grid.update_layout(
+    template="plotly_dark",
+    height=1100,
+    hovermode="x unified"
+)
+
+fig_grid.show()
+
+fig_grid.write_html(
+    OUTPUT_DIR / "04_ac_and_unbalanced_grid_validation_dashboard.html"
+)
+
+fig_weather = make_subplots(
+    rows=4,
+    cols=1,
+    shared_xaxes=True,
+    subplot_titles=(
+        "Freiburg Irradiance from NASA POWER or Fallback",
+        "Ambient Temperature",
+        "Wind Speed",
+        "PV and Wind Available Power"
+    )
+)
+
+fig_weather.add_trace(
+    go.Scatter(
+        x=data["timestamp"],
+        y=data["ghi_kwh_m2"],
+        name="GHI kWh/m²/h",
+        fill="tozeroy",
+        line=dict(color="#ffab00", width=3)
+    ),
+    row=1,
+    col=1
+)
+
+fig_weather.add_trace(
+    go.Scatter(
+        x=data["timestamp"],
+        y=data["ambient_temperature_c"],
+        name="Temperature °C",
+        line=dict(color="#ff1744", width=3)
+    ),
+    row=2,
+    col=1
+)
+
+fig_weather.add_trace(
+    go.Scatter(
+        x=data["timestamp"],
+        y=data["wind_speed_mps"],
+        name="Wind speed m/s",
+        line=dict(color="#00e5ff", width=3)
+    ),
+    row=3,
+    col=1
+)
+
+fig_weather.add_trace(
+    go.Scatter(
+        x=data["timestamp"],
+        y=data["pv_available_mw"],
+        name="PV available MW",
+        line=dict(color="#ffea00", width=3)
+    ),
+    row=4,
+    col=1
+)
+
+fig_weather.add_trace(
+    go.Scatter(
+        x=data["timestamp"],
+        y=data["wind_available_mw"],
+        name="Wind available MW",
+        line=dict(color="#00e676", width=3)
+    ),
+    row=4,
+    col=1
+)
+
+fig_weather.update_layout(
+    template="plotly_dark",
+    height=950,
+    hovermode="x unified"
+)
+
+fig_weather.show()
+
+fig_weather.write_html(
+    OUTPUT_DIR / "05_freiburg_weather_and_renewable_input.html"
+)
+
+fig_scenario = px.bar(
+    scenario_results,
+    x="scenario",
+    y=[
+        "grid_import_mwh",
+        "grid_export_mwh"
+    ],
+    barmode="group",
+    color_discrete_sequence=[
+        "#2979ff",
+        "#00e676"
+    ],
+    title="🌦️ Scenario Stress Test"
+)
+
+fig_scenario.update_layout(
+    template="plotly_dark",
+    height=550
+)
+
+fig_scenario.show()
+
+fig_scenario.write_html(
+    OUTPUT_DIR / "06_scenario_stress_test.html"
+)
+
+# ================================================================
+# 17. SAVE OUTPUTS — FIXED VERSION FOR EXCEL TIMEZONE ERROR
+# ================================================================
+
+def make_excel_safe(df):
+    """
+    Excel cannot write timezone-aware datetime columns.
+    This function converts all datetime columns to timezone-unaware strings
+    or timezone-naive datetime values before Excel export.
+    """
+    df_safe = df.copy()
+
+    for col in df_safe.columns:
+        # Handle pandas datetime columns
+        if pd.api.types.is_datetime64_any_dtype(df_safe[col]):
+            try:
+                if getattr(df_safe[col].dt, "tz", None) is not None:
+                    df_safe[col] = df_safe[col].dt.tz_convert(None)
+                else:
+                    df_safe[col] = df_safe[col].dt.tz_localize(None)
+            except Exception:
+                df_safe[col] = df_safe[col].astype(str)
+
+        # Handle object columns that may contain Timestamp values with timezone
+        elif df_safe[col].dtype == "object":
+            try:
+                sample = df_safe[col].dropna().iloc[0] if not df_safe[col].dropna().empty else None
+
+                if isinstance(sample, pd.Timestamp):
+                    df_safe[col] = pd.to_datetime(df_safe[col], errors="coerce")
+
+                    if getattr(df_safe[col].dt, "tz", None) is not None:
+                        df_safe[col] = df_safe[col].dt.tz_convert(None)
+                    else:
+                        df_safe[col] = df_safe[col].dt.tz_localize(None)
+
+            except Exception:
+                pass
+
+    return df_safe
+
+
+# Extra safety: remove timezone from known timestamp columns if they exist
+for df_name in [
+    "data",
+    "all_results",
+    "main_results",
+    "linear_grid_results",
+    "pandapower_results",
+    "opendss_results",
+    "kpi_table",
+    "degradation_table",
+    "alarms",
+    "scenario_results"
+]:
+    if df_name in globals():
+        df_obj = globals()[df_name]
+
+        for col in df_obj.columns:
+            if "timestamp" in col.lower() or "time" in col.lower():
+                try:
+                    df_obj[col] = pd.to_datetime(df_obj[col], errors="ignore")
+
+                    if pd.api.types.is_datetime64_any_dtype(df_obj[col]):
+                        try:
+                            df_obj[col] = df_obj[col].dt.tz_convert(None)
+                        except Exception:
+                            try:
+                                df_obj[col] = df_obj[col].dt.tz_localize(None)
+                            except Exception:
+                                df_obj[col] = df_obj[col].astype(str)
+
+                except Exception:
+                    df_obj[col] = df_obj[col].astype(str)
+
+        globals()[df_name] = df_obj
+
+
+# Save CSV files
+data.to_csv(
+    OUTPUT_DIR / "input_and_forecast_data_real_freiburg.csv",
+    index=False
+)
+
+all_results.to_csv(
+    OUTPUT_DIR / "all_case_dispatch_grid_ac_opendss_results.csv",
+    index=False
+)
+
+main_results.to_csv(
+    OUTPUT_DIR / "main_case_grid_supportive_results.csv",
+    index=False
+)
+
+linear_grid_results.to_csv(
+    OUTPUT_DIR / "linearized_feeder_validation_results.csv",
+    index=False
+)
+
+pandapower_results.to_csv(
+    OUTPUT_DIR / "pandapower_ac_validation_results.csv",
+    index=False
+)
+
+opendss_results.to_csv(
+    OUTPUT_DIR / "opendss_unbalanced_validation_results.csv",
+    index=False
+)
+
+kpi_table.to_csv(
+    OUTPUT_DIR / "baseline_kpi_comparison.csv",
+    index=False
+)
+
+degradation_table.to_csv(
+    OUTPUT_DIR / "rainflow_battery_degradation_by_case.csv",
+    index=False
+)
+
+alarms.to_csv(
+    OUTPUT_DIR / "scada_alarm_log.csv",
+    index=False
+)
+
+scenario_results.to_csv(
+    OUTPUT_DIR / "scenario_stress_test_results.csv",
+    index=False
+)
+
+
+# Save Excel file safely
+with pd.ExcelWriter(
+    OUTPUT_DIR / "EnergieQuartier_MPC_Extended_Results.xlsx",
+    engine="openpyxl"
+) as writer:
+
+    make_excel_safe(data).to_excel(
+        writer,
+        sheet_name="Freiburg_Input_Data",
+        index=False
+    )
+
+    make_excel_safe(all_results).to_excel(
+        writer,
+        sheet_name="All_Cases",
+        index=False
+    )
+
+    make_excel_safe(main_results).to_excel(
+        writer,
+        sheet_name="Main_Case",
+        index=False
+    )
+
+    make_excel_safe(kpi_table).to_excel(
+        writer,
+        sheet_name="KPI_Comparison",
+        index=False
+    )
+
+    make_excel_safe(degradation_table).to_excel(
+        writer,
+        sheet_name="Rainflow_Degradation",
+        index=False
+    )
+
+    make_excel_safe(linear_grid_results).to_excel(
+        writer,
+        sheet_name="Linear_Feeder",
+        index=False
+    )
+
+    make_excel_safe(pandapower_results).to_excel(
+        writer,
+        sheet_name="Pandapower_AC",
+        index=False
+    )
+
+    make_excel_safe(opendss_results).to_excel(
+        writer,
+        sheet_name="OpenDSS_Unbalanced",
+        index=False
+    )
+
+    make_excel_safe(alarms).to_excel(
+        writer,
+        sheet_name="SCADA_Alarms",
+        index=False
+    )
+
+    make_excel_safe(scenario_results).to_excel(
+        writer,
+        sheet_name="Scenarios",
+        index=False
+    )
+
+# ================================================================
+# 18. RESEARCH REPORT
+# ================================================================
+
+research_question = """
+How much can degradation-aware model predictive control of BESS, EV charging and
+heat-pump flexibility reduce operating cost, CO₂ emissions, peak grid import,
+voltage violations and feeder congestion in a representative Freiburg district
+microgrid when tested with real weather input, rainflow battery degradation,
+balanced AC validation and optional unbalanced three-phase OpenDSS validation?
+"""
+
+limitations = """
+1. NASA POWER weather is real location-based weather data, but it is not a utility SCADA measurement.
+2. Household, EV and heat-pump loads are representative synthetic district profiles.
+3. The MPC model is linear and dispatch-oriented; it is not a full electromagnetic inverter model.
+4. pandapower validation checks balanced AC power flow, while OpenDSS adds an optional unbalanced three-phase check.
+5. OpenDSS validation is representative and not based on a real Freiburg utility feeder.
+6. Rainflow cycle counting improves battery degradation realism, but cell chemistry-specific aging parameters are still simplified.
+"""
+
+report = f"""
+# {PROJECT_TITLE}
+
+## {PROJECT_SUBTITLE}
+
+### Simulation Length
+
+- Days simulated: {SIMULATION_DAYS}
+- Hours simulated: {24 * SIMULATION_DAYS}
+- Weather location: Freiburg im Breisgau, Germany
+- Weather source used in run: {data['weather_source'].iloc[0]}
+
+### Research Question
+
+{research_question}
+
+### What Was Added Compared with the Earlier Version
+
+1. Real Freiburg weather input using NASA POWER hourly irradiance, temperature and wind speed.
+2. 7-day or 30-day simulation switch instead of only 48 hours.
+3. pandapower balanced AC feeder validation.
+4. Optional OpenDSS unbalanced three-phase feeder validation.
+5. Rainflow cycle-counting degradation model for the BESS SOC profile.
+
+### System Represented
+
+- District: {CONFIG['district_name']}
+- Buildings: {CONFIG['buildings']}
+- Rooftop PV: {CONFIG['pv_rooftop_mw']} MW
+- Utility PV: {CONFIG['pv_utility_mw']} MW
+- Wind: {CONFIG['wind_mw']} MW
+- BESS: {CONFIG['bess_power_mw']} MW / {CONFIG['bess_energy_mwh']} MWh
+- EV/V2G aggregator: {CONFIG['ev_power_mw']} MW / {CONFIG['ev_energy_mwh']} MWh
+- Heat-pump flexibility: {CONFIG['heat_pump_max_mw']} MW
+- Grid connection: {CONFIG['grid_connection_mw']} MW
+
+### Compared Cases
+
+1. No flexibility  
+2. Rule-based BESS  
+3. Cost-only MPC  
+4. Degradation-aware MPC  
+5. Grid-supportive degradation-aware MPC  
+
+### MPC Objective
+
+The MPC minimizes:
+
+- grid-import cost
+- minus export revenue
+- carbon cost
+- battery degradation cost proxy
+- load-shedding penalty
+- heat-discomfort penalty
+- EV mobility-shortfall penalty
+- renewable-curtailment penalty
+
+### Validation Layers
+
+#### Layer 1: Linearized Feeder Validation
+
+Fast approximation for voltage and feeder loading screening.
+
+#### Layer 2: pandapower AC Validation
+
+Balanced AC power-flow validation of LV buses, transformer loading and line loading.
+
+#### Layer 3: OpenDSS Unbalanced Validation
+
+Optional three-phase unbalanced validation using phase-split loads and distributed PV/storage injections.
+
+### Key KPI Comparison
+
+{kpi_table.to_markdown(index=False)}
+
+### Rainflow Battery Degradation Results
+
+{degradation_table.to_markdown(index=False)}
+
+### Limitations
+
+{limitations}
+
+### Next Research Extensions
+
+- Replace representative load with German standard load profiles.
+- Add measured feeder topology if available.
+- Add chemistry-specific BESS degradation coefficients.
+- Add inverter current limits and reactive power capability curves.
+- Add stochastic MPC or robust MPC under PV/load forecast uncertainty.
+"""
+
+(
+    OUTPUT_DIR / "EnergieQuartier_MPC_Extended_Report.md"
+).write_text(report, encoding="utf-8")
+
+display(Markdown(report))
+
+summary = f"""
+{PROJECT_TITLE}
+{PROJECT_SUBTITLE}
+
+Simulation:
+- {SIMULATION_DAYS} days
+- {24 * SIMULATION_DAYS} hours
+- Freiburg weather source: {data['weather_source'].iloc[0]}
+
+Main upgrades:
+- Real Freiburg NASA POWER weather input
+- 7/30-day simulation switch
+- pandapower AC validation
+- optional OpenDSS unbalanced validation
+- rainflow battery degradation
+
+Top KPI table:
+{kpi_table.to_string(index=False)}
+
+Files created:
+- freiburg_weather_input.csv
+- input_and_forecast_data_real_freiburg.csv
+- all_case_dispatch_grid_ac_opendss_results.csv
+- main_case_grid_supportive_results.csv
+- linearized_feeder_validation_results.csv
+- pandapower_ac_validation_results.csv
+- opendss_unbalanced_validation_results.csv
+- baseline_kpi_comparison.csv
+- rainflow_battery_degradation_by_case.csv
+- scada_alarm_log.csv
+- scenario_stress_test_results.csv
+- EnergieQuartier_MPC_Extended_Results.xlsx
+- HTML dashboards
+- Markdown report
+"""
+
+(
+    OUTPUT_DIR / "run_summary.txt"
+).write_text(summary, encoding="utf-8")
+
+# ================================================================
+# 19. ZIP AND DOWNLOAD
+# ================================================================
+
+shutil.make_archive(
+    base_name=str(ZIP_PATH.with_suffix("")),
+    format="zip",
+    root_dir=OUTPUT_DIR
+)
+
+display(HTML(f"""
+<div style="
+padding:22px;
+border-radius:18px;
+background:linear-gradient(135deg,#1a237e,#7c4dff,#e040fb);
+color:white;
+font-family:Arial;
+box-shadow:0 10px 28px rgba(0,0,0,.25);
+">
+<h2 style="margin:0;">✅ EnergieQuartier MPC Extended Completed</h2>
+<p style="margin:10px 0 0 0;">Output archive: <b>{ZIP_PATH.name}</b></p>
+<p style="margin:6px 0 0 0;">Files created: <b>{len(list(OUTPUT_DIR.iterdir()))}</b></p>
+<p style="margin:6px 0 0 0;">ZIP size: <b>{ZIP_PATH.stat().st_size / 1024:.1f} KB</b></p>
+</div>
+"""))
+
+print(summary)
+
+print("\nGenerated files:")
+
+for file in sorted(OUTPUT_DIR.iterdir()):
+    print("•", file.name)
+
+try:
+    from google.colab import files
+    files.download(str(ZIP_PATH))
+except Exception:
+    print("ZIP saved at:", ZIP_PATH)
