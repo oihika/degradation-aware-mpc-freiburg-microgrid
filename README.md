@@ -407,11 +407,6 @@ This project contributes an applied simulation framework that connects:
 The project is intentionally designed to be more than a basic PV-battery simulation. It combines energy management, power-system validation, and degradation-aware optimization in one integrated workflow.
 
 ---
-Deutsche Relevanz:
-Dieses Projekt untersucht die Integration erneuerbarer Energien, Batteriespeicher,
-Elektromobilität und intelligenter Netzsteuerung im Kontext der deutschen Energiewende.
-Der Fokus liegt auf Kostenreduktion, CO₂-Minderung, Netzstabilität und effizienter Nutzung
-dezentraler Energiequellen.
 
 ## 🎓 Relevance for MSc Renewable Energy in Germany
 
